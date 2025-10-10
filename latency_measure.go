@@ -962,7 +962,7 @@ func calculatePercentiles(sortedValues []time.Duration) map[float64]time.Duratio
 	}
 
 	percentiles := map[float64]time.Duration{}
-	targets := []float64{50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99}
+	targets := []float64{10.0, 30.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99}
 	
 	for _, p := range targets {
 		index := int(float64(len(sortedValues)) * p / 100.0)
@@ -1008,12 +1008,16 @@ func printSizeStats(stats Statistics) {
 }
 
 func printPercentiles(percentiles map[float64]time.Duration) {
-	// Define the order of percentiles to print (like wrk2)
-	order := []float64{50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99}
+	// Define the order of percentiles to print (including P10 and P30)
+	order := []float64{10.0, 30.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99}
 	
 	for _, p := range order {
 		if value, exists := percentiles[p]; exists {
-			if p == 50.0 {
+			if p == 10.0 {
+				fmt.Printf("   10.000%%  %8v\n", value)
+			} else if p == 30.0 {
+				fmt.Printf("   30.000%%  %8v\n", value)
+			} else if p == 50.0 {
 				fmt.Printf("   50.000%%  %8v\n", value)
 			} else if p == 75.0 {
 				fmt.Printf("   75.000%%  %8v\n", value)
