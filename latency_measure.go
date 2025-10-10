@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,16 @@ type Statistics struct {
 	AvgOneWay    time.Duration
 	MinOneWay    time.Duration
 	MaxOneWay    time.Duration
+	RTTHistogram []HistogramBucket
+	P95RTT       time.Duration
+	P99RTT       time.Duration
+}
+
+type HistogramBucket struct {
+	LowerBound time.Duration
+	UpperBound time.Duration
+	Count      int64
+	Percentage float64
 }
 
 // TCP server data structure and implementation
@@ -93,16 +104,30 @@ func (s *TCPServer) acceptConnections() {
 func (s *TCPServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	const maxPayloadSize = 10 * 1024 * 1024 // 10MB limit
+	
+	// Reuse buffers for this connection
+	sizeBuf := make([]byte, 4)
+	timestampBuf := make([]byte, 8)
+	var payload []byte
+	var response []byte
+	
+	requestCount := 0
+
 	for {
 		// read payload size
-		sizeBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, sizeBuf); err != nil {
 			return
 		}
 		payloadSize := binary.BigEndian.Uint32(sizeBuf)
 
+		// validate payload size to prevent memory exhaustion
+		if payloadSize > maxPayloadSize {
+			fmt.Printf("Rejecting oversized payload: %d bytes (max: %d)\n", payloadSize, maxPayloadSize)
+			return
+		}
+
 		// read client timestamp
-		timestampBuf := make([]byte, 8)
 		if _, err := io.ReadFull(conn, timestampBuf); err != nil {
 			return
 		}
@@ -111,14 +136,25 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 		// record server receive time
 		serverRecvTime := time.Now().UnixNano()
 
-		// read payload
-		payload := make([]byte, payloadSize)
+		// reuse or allocate payload buffer
+		if cap(payload) < int(payloadSize) {
+			payload = make([]byte, payloadSize)
+		} else {
+			payload = payload[:payloadSize]
+		}
+		
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return
 		}
 
-		// echo back: size + client timestamp + server recv time + server send time + payload
-		response := make([]byte, 4+8+8+8+payloadSize)
+		// reuse or allocate response buffer
+		responseSize := 4 + 8 + 8 + 8 + int(payloadSize)
+		if cap(response) < responseSize {
+			response = make([]byte, responseSize)
+		} else {
+			response = response[:responseSize]
+		}
+		
 		binary.BigEndian.PutUint32(response[0:4], payloadSize)
 		binary.BigEndian.PutUint64(response[4:12], uint64(clientSendstamp))
 		binary.BigEndian.PutUint64(response[12:20], uint64(serverRecvTime))
@@ -130,6 +166,12 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 
 		if _, err := conn.Write(response); err != nil {
 			return
+		}
+		
+		requestCount++
+		// Periodically trigger GC to prevent memory buildup
+		if requestCount%1000 == 0 {
+			runtime.GC()
 		}
 	}
 }
@@ -167,9 +209,24 @@ func (s *HTTPServer) Start() error {
 	return nil
 }
 
+// Global buffer pool for HTTP server
+var httpBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 0, 64*1024) // 64KB initial capacity
+	},
+}
+
 func (s *HTTPServer) handleEcho(w http.ResponseWriter, r *http.Request) {
+	const maxPayloadSize = 10 * 1024 * 1024 // 10MB limit
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check content length to prevent memory exhaustion
+	if r.ContentLength > maxPayloadSize {
+		http.Error(w, fmt.Sprintf("Payload too large: %d bytes (max: %d)", r.ContentLength, maxPayloadSize), http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -181,8 +238,17 @@ func (s *HTTPServer) handleEcho(w http.ResponseWriter, r *http.Request) {
 
 	serverRecvTime := time.Now().UnixNano()
 
-	// Read body
-	body, err := io.ReadAll(r.Body)
+	// Use buffer pool for reading body
+	buf := httpBufferPool.Get().([]byte)
+	defer httpBufferPool.Put(buf[:0])
+	
+	// Ensure buffer has enough capacity
+	if int64(cap(buf)) < r.ContentLength {
+		buf = make([]byte, 0, r.ContentLength)
+	}
+	
+	// Read body with size limit using buffer
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPayloadSize))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -204,6 +270,97 @@ func (s *HTTPServer) Stop() {
 	}
 }
 
+// Connection pool for TCP connections
+type TCPConnectionPool struct {
+	connections chan net.Conn
+	host        string
+	port        int
+	timeout     time.Duration
+	maxSize     int
+}
+
+func NewTCPConnectionPool(host string, port int, timeout time.Duration, maxSize int) *TCPConnectionPool {
+	return &TCPConnectionPool{
+		connections: make(chan net.Conn, maxSize),
+		host:        host,
+		port:        port,
+		timeout:     timeout,
+		maxSize:     maxSize,
+	}
+}
+
+func (pool *TCPConnectionPool) Get() (net.Conn, error) {
+	select {
+	case conn := <-pool.connections:
+		// Test if connection is still valid
+		conn.SetReadDeadline(time.Now().Add(time.Millisecond))
+		one := make([]byte, 1)
+		if _, err := conn.Read(one); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Connection is good, reset deadline
+				conn.SetReadDeadline(time.Time{})
+				return conn, nil
+			}
+			// Connection is bad, close it and create new one
+			conn.Close()
+		}
+	default:
+		// No connection available, create new one
+	}
+	
+	return net.DialTimeout("tcp", fmt.Sprintf("%s:%d", pool.host, pool.port), pool.timeout)
+}
+
+func (pool *TCPConnectionPool) Put(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	
+	select {
+	case pool.connections <- conn:
+		// Successfully returned to pool
+	default:
+		// Pool is full, close the connection
+		conn.Close()
+	}
+}
+
+func (pool *TCPConnectionPool) Close() {
+	close(pool.connections)
+	for conn := range pool.connections {
+		conn.Close()
+	}
+}
+
+// Buffer pool for reusing byte slices
+type BufferPool struct {
+	pool sync.Pool
+}
+
+func NewBufferPool() *BufferPool {
+	return &BufferPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 0, 64*1024) // 64KB initial capacity
+			},
+		},
+	}
+}
+
+func (bp *BufferPool) Get(size int) []byte {
+	buf := bp.pool.Get().([]byte)
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func (bp *BufferPool) Put(buf []byte) {
+	if cap(buf) <= 1024*1024 { // Only pool buffers up to 1MB
+		bp.pool.Put(buf[:0])
+	}
+}
+
 // Latency tester data structure and implementation
 type LatencyTester struct {
 	host              string
@@ -218,14 +375,29 @@ type LatencyTester struct {
 	resultsMutex      sync.Mutex
 	clockOffset       time.Duration
 	clockOffsetSynced bool
+	tcpPool           *TCPConnectionPool
+	bufferPool        *BufferPool
+	httpClient        *http.Client
 }
 
 func NewLatencyTester(host string, tcpPort int, httpPort int) *LatencyTester {
+	// Create HTTP client with connection pooling
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+	
 	return &LatencyTester{
-		host:     host,
-		tcpPort:  tcpPort,
-		httpPort: httpPort,
-		results:  make([]LatencyResult, 0),
+		host:       host,
+		tcpPort:    tcpPort,
+		httpPort:   httpPort,
+		results:    make([]LatencyResult, 0),
+		bufferPool: NewBufferPool(),
+		httpClient: httpClient,
 	}
 }
 
@@ -233,8 +405,24 @@ func (lt *LatencyTester) RunTests(protocols []string, payloadSizes []int, testPe
 	lt.protocols = protocols
 	lt.payloadSizes = payloadSizes
 	lt.testPerSize = testPerSize
-	lt.concurrent = concurrent
 	lt.timeout = timeout
+	
+	// Optimize concurrent workers based on system and test size
+	if concurrent <= 0 {
+		concurrent = runtime.NumCPU()
+	}
+	// Limit concurrency to prevent overwhelming the server
+	maxConcurrent := 50
+	if concurrent > maxConcurrent {
+		concurrent = maxConcurrent
+	}
+	lt.concurrent = concurrent
+
+	// Initialize TCP connection pool if TCP protocol is used
+	if contains(protocols, "tcp") {
+		lt.tcpPool = NewTCPConnectionPool(lt.host, lt.tcpPort, timeout, concurrent*2)
+		defer lt.tcpPool.Close()
+	}
 
 	// sync clock
 	if err := lt.SyncClock(); err != nil {
@@ -246,16 +434,20 @@ func (lt *LatencyTester) RunTests(protocols []string, payloadSizes []int, testPe
 	fmt.Printf("\nStarting latency tests...")
 	fmt.Printf("Target: %s:%d (TCP) %s:%d (HTTP)", lt.host, lt.tcpPort, lt.host, lt.httpPort)
 	fmt.Printf("Payload sizes: %v bytes", lt.payloadSizes)
-	fmt.Printf("Protocols: %v\n", lt.protocols)
+	fmt.Printf("Protocols: %v", lt.protocols)
+	fmt.Printf("Concurrent workers: %d\n", lt.concurrent)
 	fmt.Printf("========================================")
 
 	totalTests := len(payloadSizes) * len(protocols) * testPerSize
 	var completedTests int64
+	
+	// Pre-allocate results slice to avoid frequent reallocations
+	lt.results = make([]LatencyResult, 0, totalTests)
 
-	// create worker pool
-	taskChan := make(chan func(), totalTests)
+	// create worker pool with rate limiting
+	taskChan := make(chan func(), concurrent*2) // Buffer to prevent blocking
 	var wg sync.WaitGroup
-
+	
 	// start workers
 	for i := 0; i < lt.concurrent; i++ {
 		wg.Add(1)
@@ -279,9 +471,9 @@ func (lt *LatencyTester) RunTests(protocols []string, payloadSizes []int, testPe
 				taskChan <- func() {
 					var result LatencyResult
 					if proto == "tcp" {
-						result = lt.testTCP(payloadSize)
+						result = lt.testTCPPooled(payloadSize)
 					} else if proto == "http" {
-						result = lt.testHTTP(payloadSize)
+						result = lt.testHTTPPooled(payloadSize)
 					}
 					lt.resultsMutex.Lock()
 					lt.results = append(lt.results, result)
@@ -294,7 +486,12 @@ func (lt *LatencyTester) RunTests(protocols []string, payloadSizes []int, testPe
 	close(taskChan)
 	wg.Wait()
 
+	// Final progress update
+	fmt.Printf("\rProgress: %d/%d (100.00%%)", totalTests, totalTests)
 	fmt.Printf("\nLatency tests completed.\n")
+	
+	// Force garbage collection to free up memory
+	runtime.GC()
 }
 
 // SyncClock implements NTP-like algorithm to synchronize clocks
@@ -460,6 +657,77 @@ func (lt *LatencyTester) testTCP(payloadSize int) LatencyResult {
 	return result
 }
 
+func (lt *LatencyTester) testTCPPooled(payloadSize int) LatencyResult {
+	result := LatencyResult{
+		Protocol:    "tcp",
+		PayloadSize: payloadSize,
+		Success:     false,
+	}
+
+	conn, err := lt.tcpPool.Get()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	
+	// Set timeout for this test
+	conn.SetDeadline(time.Now().Add(lt.timeout))
+	defer func() {
+		conn.SetDeadline(time.Time{}) // Clear deadline
+		lt.tcpPool.Put(conn)
+	}()
+
+	t1 := time.Now().UnixNano()
+
+	// Use buffer pool for payload
+	payload := lt.bufferPool.Get(payloadSize)
+	defer lt.bufferPool.Put(payload)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	// Use buffer pool for request
+	requestSize := 4 + 8 + payloadSize
+	request := lt.bufferPool.Get(requestSize)
+	defer lt.bufferPool.Put(request)
+	
+	binary.BigEndian.PutUint32(request[0:4], uint32(payloadSize))
+	binary.BigEndian.PutUint64(request[4:12], uint64(t1))
+	copy(request[12:], payload)
+
+	if _, err := conn.Write(request); err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	// Use buffer pool for response
+	responseSize := 4 + 8 + 8 + 8 + payloadSize
+	response := lt.bufferPool.Get(responseSize)
+	defer lt.bufferPool.Put(response)
+	
+	if _, err := io.ReadFull(conn, response); err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	t4 := time.Now().UnixNano()
+
+	t2 := int64(binary.BigEndian.Uint64(response[12:20]))
+	t3 := int64(binary.BigEndian.Uint64(response[20:28]))
+
+	result.RTT = time.Duration(t4 - t1)
+	result.ClockOffset = time.Duration(((t2 - t1) + (t3 - t4)) / 2)
+
+	if lt.clockOffsetSynced {
+		result.OneWayLatency = time.Duration(t2 - t1 - int64(lt.clockOffset))
+	} else {
+		result.OneWayLatency = time.Duration(t2 - t1 - int64(result.ClockOffset))
+	}
+
+	result.Success = true
+	return result
+}
+
 func (lt *LatencyTester) testHTTP(payloadSize int) LatencyResult {
 	result := LatencyResult{
 		Protocol:    "http",
@@ -486,6 +754,56 @@ func (lt *LatencyTester) testHTTP(payloadSize int) LatencyResult {
 	req.Header.Set("Content-Type", "application/octet-stream")
 
 	resp, err := client.Do(req)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	defer resp.Body.Close()
+
+	t4 := time.Now().UnixNano()
+
+	t2, _ := strconv.ParseInt(resp.Header.Get("X-Server-Recv-Time"), 10, 64)
+	t3, _ := strconv.ParseInt(resp.Header.Get("X-Server-Send-Time"), 10, 64)
+
+	result.RTT = time.Duration(t4 - t1)
+	result.ClockOffset = time.Duration(((t2 - t1) + (t3 - t4)) / 2)
+
+	if lt.clockOffsetSynced {
+		result.OneWayLatency = time.Duration(t2 - t1 - int64(lt.clockOffset))
+	} else {
+		result.OneWayLatency = time.Duration(t2 - t1 - int64(result.ClockOffset))
+	}
+
+	result.Success = true
+	return result
+}
+
+func (lt *LatencyTester) testHTTPPooled(payloadSize int) LatencyResult {
+	result := LatencyResult{
+		Protocol:    "http",
+		PayloadSize: payloadSize,
+		Success:     false,
+	}
+
+	t1 := time.Now().UnixNano()
+
+	// Use buffer pool for payload
+	payload := lt.bufferPool.Get(payloadSize)
+	defer lt.bufferPool.Put(payload)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s:%d/echo", lt.host, lt.httpPort), bytes.NewReader(payload))
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	req.Header.Set("X-Client-Timestamp", fmt.Sprintf("%d", t1))
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := lt.httpClient.Do(req)
 	if err != nil {
 		result.Error = err.Error()
 		return result
@@ -560,6 +878,22 @@ func (lt *LatencyTester) AnalyzeResults() {
 		if results, exists := sizeStats[size]; exists {
 			stats := calculateStatistics("", size, results)
 			printSizeStats(stats)
+			
+			// Also show protocol breakdown for this payload size
+			protocolBreakdown := make(map[string][]LatencyResult)
+			for _, result := range results {
+				protocolBreakdown[result.Protocol] = append(protocolBreakdown[result.Protocol], result)
+			}
+			
+			if len(protocolBreakdown) > 1 {
+				fmt.Printf("  Protocol breakdown:\n")
+				for protocol, protocolResults := range protocolBreakdown {
+					protocolStats := calculateStatistics(protocol, size, protocolResults)
+					fmt.Printf("    %s (%d tests): RTT Avg: %v, One-Way Avg: %v\n", 
+						strings.ToUpper(protocol), protocolStats.Count, protocolStats.AvgRTT, protocolStats.AvgOneWay)
+				}
+				fmt.Printf("\n")
+			}
 		}
 	}
 }
@@ -599,6 +933,19 @@ func calculateStatistics(protocol string, payloadSize int, results []LatencyResu
 	stats.MaxRTT = rttValues[len(rttValues)-1]
 	stats.MedianRTT = rttValues[len(rttValues)/2]
 
+	// Calculate percentiles
+	p95Index := int(float64(len(rttValues)) * 0.95)
+	if p95Index >= len(rttValues) {
+		p95Index = len(rttValues) - 1
+	}
+	stats.P95RTT = rttValues[p95Index]
+
+	p99Index := int(float64(len(rttValues)) * 0.99)
+	if p99Index >= len(rttValues) {
+		p99Index = len(rttValues) - 1
+	}
+	stats.P99RTT = rttValues[p99Index]
+
 	// Calculate standard deviation for RTT
 	var rttVarianceSum float64
 	for _, rtt := range rttValues {
@@ -612,7 +959,51 @@ func calculateStatistics(protocol string, payloadSize int, results []LatencyResu
 	stats.MinOneWay = oneWayValues[0]
 	stats.MaxOneWay = oneWayValues[len(oneWayValues)-1]
 
+	// Calculate histogram
+	stats.RTTHistogram = calculateHistogram(rttValues)
+
 	return stats
+}
+
+func calculateHistogram(sortedValues []time.Duration) []HistogramBucket {
+	if len(sortedValues) == 0 {
+		return nil
+	}
+
+	minVal := sortedValues[0]
+	maxVal := sortedValues[len(sortedValues)-1]
+	
+	// Create 10 buckets
+	numBuckets := 10
+	buckets := make([]HistogramBucket, numBuckets)
+	
+	// Calculate bucket size
+	bucketSize := time.Duration(float64(maxVal-minVal) / float64(numBuckets))
+	if bucketSize == 0 {
+		bucketSize = time.Microsecond // Minimum bucket size
+	}
+
+	// Initialize buckets
+	for i := 0; i < numBuckets; i++ {
+		buckets[i].LowerBound = minVal + time.Duration(i)*bucketSize
+		if i == numBuckets-1 {
+			buckets[i].UpperBound = maxVal
+		} else {
+			buckets[i].UpperBound = minVal + time.Duration(i+1)*bucketSize
+		}
+	}
+
+	// Count values in each bucket
+	valueIndex := 0
+	for i := 0; i < numBuckets && valueIndex < len(sortedValues); i++ {
+		for valueIndex < len(sortedValues) && sortedValues[valueIndex] <= buckets[i].UpperBound {
+			buckets[i].Count++
+			valueIndex++
+		}
+		buckets[i].Percentage = float64(buckets[i].Count) / float64(len(sortedValues)) * 100
+	}
+
+	return buckets
 }
 
 func printProtocolStats(stats Statistics) {
@@ -620,8 +1011,15 @@ func printProtocolStats(stats Statistics) {
 	fmt.Printf("  Tests: %d\n", stats.Count)
 	fmt.Printf("  RTT - Avg: %v, Min: %v, Max: %v, Median: %v, StdDev: %v\n",
 		stats.AvgRTT, stats.MinRTT, stats.MaxRTT, stats.MedianRTT, stats.StdDevRTT)
+	fmt.Printf("  RTT - P95: %v, P99: %v\n", stats.P95RTT, stats.P99RTT)
 	fmt.Printf("  One-Way - Avg: %v, Min: %v, Max: %v\n",
 		stats.AvgOneWay, stats.MinOneWay, stats.MaxOneWay)
+	
+	// Print histogram
+	if len(stats.RTTHistogram) > 0 {
+		fmt.Printf("  RTT Histogram:\n")
+		printHistogram(stats.RTTHistogram)
+	}
 	fmt.Printf("\n")
 }
 
@@ -630,9 +1028,43 @@ func printSizeStats(stats Statistics) {
 	fmt.Printf("  Tests: %d\n", stats.Count)
 	fmt.Printf("  RTT - Avg: %v, Min: %v, Max: %v, Median: %v, StdDev: %v\n",
 		stats.AvgRTT, stats.MinRTT, stats.MaxRTT, stats.MedianRTT, stats.StdDevRTT)
+	fmt.Printf("  RTT - P95: %v, P99: %v\n", stats.P95RTT, stats.P99RTT)
 	fmt.Printf("  One-Way - Avg: %v, Min: %v, Max: %v\n",
 		stats.AvgOneWay, stats.MinOneWay, stats.MaxOneWay)
+	
+	// Print histogram
+	if len(stats.RTTHistogram) > 0 {
+		fmt.Printf("  RTT Histogram:\n")
+		printHistogram(stats.RTTHistogram)
+	}
 	fmt.Printf("\n")
+}
+
+func printHistogram(histogram []HistogramBucket) {
+	// Find the maximum count for scaling the visual bars
+	maxCount := int64(0)
+	for _, bucket := range histogram {
+		if bucket.Count > maxCount {
+			maxCount = bucket.Count
+		}
+	}
+	
+	// Print each bucket
+	for _, bucket := range histogram {
+		if bucket.Count == 0 {
+			continue // Skip empty buckets
+		}
+		
+		// Create visual bar (max 50 characters)
+		barLength := int(float64(bucket.Count) / float64(maxCount) * 50)
+		bar := strings.Repeat("█", barLength)
+		if barLength == 0 && bucket.Count > 0 {
+			bar = "▌" // Show at least something for non-zero counts
+		}
+		
+		fmt.Printf("    %8v - %8v: %6d (%5.1f%%) %s\n", 
+			bucket.LowerBound, bucket.UpperBound, bucket.Count, bucket.Percentage, bar)
+	}
 }
 
 func contains(slice []string, item string) bool {
