@@ -56,16 +56,12 @@ type Statistics struct {
 	AvgOneWay    time.Duration
 	MinOneWay    time.Duration
 	MaxOneWay    time.Duration
-	RTTHistogram []HistogramBucket
-	P95RTT       time.Duration
-	P99RTT       time.Duration
+	Percentiles  map[float64]time.Duration // P50, P75, P90, P95, P99, P99.9, P99.99
 }
 
-type HistogramBucket struct {
-	LowerBound time.Duration
-	UpperBound time.Duration
-	Count      int64
-	Percentage float64
+type PercentileData struct {
+	Percentile float64
+	Value      time.Duration
 }
 
 // TCP server data structure and implementation
@@ -879,20 +875,28 @@ func (lt *LatencyTester) AnalyzeResults() {
 			stats := calculateStatistics("", size, results)
 			printSizeStats(stats)
 			
-			// Also show protocol breakdown for this payload size
+			// Show separate protocol histograms for this payload size
 			protocolBreakdown := make(map[string][]LatencyResult)
 			for _, result := range results {
 				protocolBreakdown[result.Protocol] = append(protocolBreakdown[result.Protocol], result)
 			}
 			
 			if len(protocolBreakdown) > 1 {
-				fmt.Printf("  Protocol breakdown:\n")
+				fmt.Printf("  Protocol Breakdown:\n")
 				for protocol, protocolResults := range protocolBreakdown {
 					protocolStats := calculateStatistics(protocol, size, protocolResults)
-					fmt.Printf("    %s (%d tests): RTT Avg: %v, One-Way Avg: %v\n", 
-						strings.ToUpper(protocol), protocolStats.Count, protocolStats.AvgRTT, protocolStats.AvgOneWay)
+					fmt.Printf("    %s Protocol (%d tests):\n", strings.ToUpper(protocol), protocolStats.Count)
+					fmt.Printf("      RTT - Avg: %v, Min: %v, Max: %v, StdDev: %v\n", 
+						protocolStats.AvgRTT, protocolStats.MinRTT, protocolStats.MaxRTT, protocolStats.StdDevRTT)
+					fmt.Printf("      One-Way - Avg: %v, Min: %v, Max: %v\n",
+						protocolStats.AvgOneWay, protocolStats.MinOneWay, protocolStats.MaxOneWay)
+					
+					if len(protocolStats.Percentiles) > 0 {
+						fmt.Printf("      Latency Distribution:\n")
+						printPercentiles(protocolStats.Percentiles)
+					}
+					fmt.Printf("\n")
 				}
-				fmt.Printf("\n")
 			}
 		}
 	}
@@ -933,19 +937,6 @@ func calculateStatistics(protocol string, payloadSize int, results []LatencyResu
 	stats.MaxRTT = rttValues[len(rttValues)-1]
 	stats.MedianRTT = rttValues[len(rttValues)/2]
 
-	// Calculate percentiles
-	p95Index := int(float64(len(rttValues)) * 0.95)
-	if p95Index >= len(rttValues) {
-		p95Index = len(rttValues) - 1
-	}
-	stats.P95RTT = rttValues[p95Index]
-
-	p99Index := int(float64(len(rttValues)) * 0.99)
-	if p99Index >= len(rttValues) {
-		p99Index = len(rttValues) - 1
-	}
-	stats.P99RTT = rttValues[p99Index]
-
 	// Calculate standard deviation for RTT
 	var rttVarianceSum float64
 	for _, rtt := range rttValues {
@@ -959,51 +950,29 @@ func calculateStatistics(protocol string, payloadSize int, results []LatencyResu
 	stats.MinOneWay = oneWayValues[0]
 	stats.MaxOneWay = oneWayValues[len(oneWayValues)-1]
 
-	// Calculate histogram
-	stats.RTTHistogram = calculateHistogram(rttValues)
+	// Calculate percentiles
+	stats.Percentiles = calculatePercentiles(rttValues)
 
 	return stats
 }
 
-func calculateHistogram(sortedValues []time.Duration) []HistogramBucket {
+func calculatePercentiles(sortedValues []time.Duration) map[float64]time.Duration {
 	if len(sortedValues) == 0 {
 		return nil
 	}
 
-	minVal := sortedValues[0]
-	maxVal := sortedValues[len(sortedValues)-1]
+	percentiles := map[float64]time.Duration{}
+	targets := []float64{50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99}
 	
-	// Create 10 buckets
-	numBuckets := 10
-	buckets := make([]HistogramBucket, numBuckets)
+	for _, p := range targets {
+		index := int(float64(len(sortedValues)) * p / 100.0)
+		if index >= len(sortedValues) {
+			index = len(sortedValues) - 1
+		}
+		percentiles[p] = sortedValues[index]
+	}
 	
-	// Calculate bucket size
-	bucketSize := time.Duration(float64(maxVal-minVal) / float64(numBuckets))
-	if bucketSize == 0 {
-		bucketSize = time.Microsecond // Minimum bucket size
-	}
-
-	// Initialize buckets
-	for i := 0; i < numBuckets; i++ {
-		buckets[i].LowerBound = minVal + time.Duration(i)*bucketSize
-		if i == numBuckets-1 {
-			buckets[i].UpperBound = maxVal
-		} else {
-			buckets[i].UpperBound = minVal + time.Duration(i+1)*bucketSize
-		}
-	}
-
-	// Count values in each bucket
-	valueIndex := 0
-	for i := 0; i < numBuckets && valueIndex < len(sortedValues); i++ {
-		for valueIndex < len(sortedValues) && sortedValues[valueIndex] <= buckets[i].UpperBound {
-			buckets[i].Count++
-			valueIndex++
-		}
-		buckets[i].Percentage = float64(buckets[i].Count) / float64(len(sortedValues)) * 100
-	}
-
-	return buckets
+	return percentiles
 }
 
 func printProtocolStats(stats Statistics) {
@@ -1011,14 +980,13 @@ func printProtocolStats(stats Statistics) {
 	fmt.Printf("  Tests: %d\n", stats.Count)
 	fmt.Printf("  RTT - Avg: %v, Min: %v, Max: %v, Median: %v, StdDev: %v\n",
 		stats.AvgRTT, stats.MinRTT, stats.MaxRTT, stats.MedianRTT, stats.StdDevRTT)
-	fmt.Printf("  RTT - P95: %v, P99: %v\n", stats.P95RTT, stats.P99RTT)
 	fmt.Printf("  One-Way - Avg: %v, Min: %v, Max: %v\n",
 		stats.AvgOneWay, stats.MinOneWay, stats.MaxOneWay)
 	
-	// Print histogram
-	if len(stats.RTTHistogram) > 0 {
-		fmt.Printf("  RTT Histogram:\n")
-		printHistogram(stats.RTTHistogram)
+	// Print percentile distribution
+	if len(stats.Percentiles) > 0 {
+		fmt.Printf("  Latency Distribution:\n")
+		printPercentiles(stats.Percentiles)
 	}
 	fmt.Printf("\n")
 }
@@ -1028,42 +996,39 @@ func printSizeStats(stats Statistics) {
 	fmt.Printf("  Tests: %d\n", stats.Count)
 	fmt.Printf("  RTT - Avg: %v, Min: %v, Max: %v, Median: %v, StdDev: %v\n",
 		stats.AvgRTT, stats.MinRTT, stats.MaxRTT, stats.MedianRTT, stats.StdDevRTT)
-	fmt.Printf("  RTT - P95: %v, P99: %v\n", stats.P95RTT, stats.P99RTT)
 	fmt.Printf("  One-Way - Avg: %v, Min: %v, Max: %v\n",
 		stats.AvgOneWay, stats.MinOneWay, stats.MaxOneWay)
 	
-	// Print histogram
-	if len(stats.RTTHistogram) > 0 {
-		fmt.Printf("  RTT Histogram:\n")
-		printHistogram(stats.RTTHistogram)
+	// Print percentile distribution
+	if len(stats.Percentiles) > 0 {
+		fmt.Printf("  Latency Distribution:\n")
+		printPercentiles(stats.Percentiles)
 	}
 	fmt.Printf("\n")
 }
 
-func printHistogram(histogram []HistogramBucket) {
-	// Find the maximum count for scaling the visual bars
-	maxCount := int64(0)
-	for _, bucket := range histogram {
-		if bucket.Count > maxCount {
-			maxCount = bucket.Count
-		}
-	}
+func printPercentiles(percentiles map[float64]time.Duration) {
+	// Define the order of percentiles to print (like wrk2)
+	order := []float64{50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99}
 	
-	// Print each bucket
-	for _, bucket := range histogram {
-		if bucket.Count == 0 {
-			continue // Skip empty buckets
+	for _, p := range order {
+		if value, exists := percentiles[p]; exists {
+			if p == 50.0 {
+				fmt.Printf("   50.000%%  %8v\n", value)
+			} else if p == 75.0 {
+				fmt.Printf("   75.000%%  %8v\n", value)
+			} else if p == 90.0 {
+				fmt.Printf("   90.000%%  %8v\n", value)
+			} else if p == 95.0 {
+				fmt.Printf("   95.000%%  %8v\n", value)
+			} else if p == 99.0 {
+				fmt.Printf("   99.000%%  %8v\n", value)
+			} else if p == 99.9 {
+				fmt.Printf("   99.900%%  %8v\n", value)
+			} else if p == 99.99 {
+				fmt.Printf("   99.990%%  %8v\n", value)
+			}
 		}
-		
-		// Create visual bar (max 50 characters)
-		barLength := int(float64(bucket.Count) / float64(maxCount) * 50)
-		bar := strings.Repeat("█", barLength)
-		if barLength == 0 && bucket.Count > 0 {
-			bar = "▌" // Show at least something for non-zero counts
-		}
-		
-		fmt.Printf("    %8v - %8v: %6d (%5.1f%%) %s\n", 
-			bucket.LowerBound, bucket.UpperBound, bucket.Count, bucket.Percentage, bar)
 	}
 }
 
