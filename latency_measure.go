@@ -18,6 +18,13 @@ import (
 	"time"
 )
 
+// Global histogram configuration
+var (
+	globalHistogramBuckets int
+	globalHistogramWidth   time.Duration
+	globalHistogramEnabled bool
+)
+
 type TimeSyncPacket struct {
 	ServerSendTime    int64
 	ServerReceiveTime int64
@@ -42,6 +49,15 @@ type LatencyResult struct {
 	Error       string
 }
 
+type Histogram struct {
+	BucketRanges []time.Duration // Upper bounds for each bucket
+	BucketCounts []int64         // Count of values in each bucket
+	BucketWidth  time.Duration   // Width of each bucket (for fixed-width histograms)
+	MinValue     time.Duration   // Minimum observed value
+	MaxValue     time.Duration   // Maximum observed value
+	TotalCount   int64           // Total number of values
+}
+
 type Statistics struct {
 	Protocol     string
 	PayloadSize  int
@@ -57,6 +73,8 @@ type Statistics struct {
 	MinOneWay    time.Duration
 	MaxOneWay    time.Duration
 	Percentiles  map[float64]time.Duration // P50, P75, P90, P95, P99, P99.9, P99.99
+	RTTHistogram *Histogram                // Histogram for RTT values
+	OneWayHistogram *Histogram             // Histogram for one-way latency values
 }
 
 type PercentileData struct {
@@ -374,6 +392,152 @@ type LatencyTester struct {
 	tcpPool           *TCPConnectionPool
 	bufferPool        *BufferPool
 	httpClient        *http.Client
+	rateLimit         float64
+	maxWorkers        int
+	requestedWorkers  int
+	activeWorkers     int64
+	workerStats       []WorkerStats
+	statsMutex        sync.RWMutex
+	scalingMutex      sync.Mutex
+	taskQueue         chan func() LatencyResult
+	workerScaler      *WorkerScaler
+	completedTests    int64
+}
+
+// WorkerStats tracks per-worker performance metrics
+type WorkerStats struct {
+	WorkerID        int
+	PacketsSent     int64
+	PacketsSuccess  int64
+	PacketsFailed   int64
+	TotalLatency    time.Duration
+	LastPacketTime  time.Time
+	IsActive        bool
+	StartTime       time.Time
+}
+
+// WorkerScaler manages dynamic worker scaling based on queue depth and load
+type WorkerScaler struct {
+	tester           *LatencyTester
+	stopChan         chan struct{}
+	scalingInterval  time.Duration
+	queueThreshold   int
+	scaleUpDelay     time.Duration
+	scaleDownDelay   time.Duration
+	lastScaleAction  time.Time
+}
+
+func NewWorkerScaler(tester *LatencyTester) *WorkerScaler {
+	return &WorkerScaler{
+		tester:          tester,
+		stopChan:        make(chan struct{}),
+		scalingInterval: 2 * time.Second,  // Check every 2 seconds
+		queueThreshold:  10,               // Scale up if queue > 10 tasks
+		scaleUpDelay:    5 * time.Second,  // Wait 5s between scale-ups
+		scaleDownDelay:  10 * time.Second, // Wait 10s between scale-downs
+	}
+}
+
+// Start begins the worker scaling monitoring
+func (ws *WorkerScaler) Start() {
+	go ws.scalingLoop()
+}
+
+// Stop stops the worker scaling monitoring
+func (ws *WorkerScaler) Stop() {
+	close(ws.stopChan)
+}
+
+// scalingLoop monitors queue depth and scales workers accordingly
+func (ws *WorkerScaler) scalingLoop() {
+	ticker := time.NewTicker(ws.scalingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ws.stopChan:
+			return
+		case <-ticker.C:
+			ws.checkAndScale()
+		}
+	}
+}
+
+// checkAndScale evaluates current load and scales workers if needed
+func (ws *WorkerScaler) checkAndScale() {
+	ws.tester.scalingMutex.Lock()
+	defer ws.tester.scalingMutex.Unlock()
+
+	currentWorkers := int(atomic.LoadInt64(&ws.tester.activeWorkers))
+	queueDepth := len(ws.tester.taskQueue)
+	
+	now := time.Now()
+	
+	// Scale up if queue is deep and we haven't scaled recently
+	if queueDepth > ws.queueThreshold && 
+	   currentWorkers < ws.tester.maxWorkers && 
+	   now.Sub(ws.lastScaleAction) > ws.scaleUpDelay {
+		
+		newWorkers := min(currentWorkers+2, ws.tester.maxWorkers) // Scale up by 2
+		ws.scaleUp(newWorkers - currentWorkers)
+		ws.lastScaleAction = now
+		fmt.Printf("\n[SCALING] Queue depth: %d, scaling UP to %d workers\n", queueDepth, newWorkers)
+		
+	} else if queueDepth == 0 && 
+			  currentWorkers > ws.tester.requestedWorkers && 
+			  now.Sub(ws.lastScaleAction) > ws.scaleDownDelay {
+		
+		newWorkers := max(currentWorkers-1, ws.tester.requestedWorkers) // Scale down by 1
+		ws.scaleDown(currentWorkers - newWorkers)
+		ws.lastScaleAction = now
+		fmt.Printf("\n[SCALING] Queue empty, scaling DOWN to %d workers\n", newWorkers)
+	}
+}
+
+// scaleUp adds new workers
+func (ws *WorkerScaler) scaleUp(count int) {
+	for i := 0; i < count; i++ {
+		ws.startNewWorker()
+	}
+}
+
+// scaleDown removes workers (they will exit when queue is empty)
+func (ws *WorkerScaler) scaleDown(count int) {
+	// Workers will naturally exit when queue is empty and they exceed requested count
+	// This is handled in the worker loop
+}
+
+// startNewWorker creates and starts a new worker goroutine
+func (ws *WorkerScaler) startNewWorker() {
+	workerID := len(ws.tester.workerStats)
+	
+	// Extend worker stats array
+	ws.tester.statsMutex.Lock()
+	ws.tester.workerStats = append(ws.tester.workerStats, WorkerStats{
+		WorkerID:  workerID,
+		IsActive:  true,
+		StartTime: time.Now(),
+	})
+	ws.tester.statsMutex.Unlock()
+	
+	atomic.AddInt64(&ws.tester.activeWorkers, 1)
+	
+	go ws.tester.workerLoop(workerID)
+}
+
+// Helper functions
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func NewLatencyTester(host string, tcpPort int, httpPort int) *LatencyTester {
@@ -403,16 +567,35 @@ func (lt *LatencyTester) RunTests(protocols []string, payloadSizes []int, testPe
 	lt.testPerSize = testPerSize
 	lt.timeout = timeout
 	
-	// Optimize concurrent workers based on system and test size
+	// Set up Kubernetes-style request/limit model
 	if concurrent <= 0 {
 		concurrent = runtime.NumCPU()
 	}
-	// Limit concurrency to prevent overwhelming the server
-	maxConcurrent := 50
-	if concurrent > maxConcurrent {
-		concurrent = maxConcurrent
+	
+	// Validate request vs limit
+	if concurrent > lt.maxWorkers {
+		fmt.Printf("Warning: Requested workers (%d) exceeds limit (%d). Using limit as request.\n", concurrent, lt.maxWorkers)
+		concurrent = lt.maxWorkers
 	}
-	lt.concurrent = concurrent
+	
+	lt.requestedWorkers = concurrent  // Request (guaranteed minimum)
+	lt.concurrent = concurrent        // For compatibility
+	
+	// Initialize task queue with buffer
+	lt.taskQueue = make(chan func() LatencyResult, lt.maxWorkers*2)
+	
+	// Initialize worker stats for requested workers
+	lt.workerStats = make([]WorkerStats, 0, lt.maxWorkers)
+	for i := 0; i < lt.requestedWorkers; i++ {
+		lt.workerStats = append(lt.workerStats, WorkerStats{
+			WorkerID:  i,
+			IsActive:  true,
+			StartTime: time.Now(),
+		})
+	}
+	
+	// Initialize worker scaler
+	lt.workerScaler = NewWorkerScaler(lt)
 
 	// Initialize TCP connection pool if TCP protocol is used
 	if contains(protocols, "tcp") {
@@ -431,55 +614,78 @@ func (lt *LatencyTester) RunTests(protocols []string, payloadSizes []int, testPe
 	fmt.Printf("Target: %s:%d (TCP) %s:%d (HTTP)", lt.host, lt.tcpPort, lt.host, lt.httpPort)
 	fmt.Printf("Payload sizes: %v bytes", lt.payloadSizes)
 	fmt.Printf("Protocols: %v", lt.protocols)
-	fmt.Printf("Concurrent workers: %d\n", lt.concurrent)
-	fmt.Printf("========================================")
+	fmt.Printf("Workers: %d requested, %d limit", lt.requestedWorkers, lt.maxWorkers)
+	if lt.rateLimit > 0 {
+		fmt.Printf(" (Rate limited: %.1f pps)", lt.rateLimit)
+	}
+	fmt.Printf("\n========================================")
 
 	totalTests := len(payloadSizes) * len(protocols) * testPerSize
-	var completedTests int64
+	atomic.StoreInt64(&lt.completedTests, 0)
 	
 	// Pre-allocate results slice to avoid frequent reallocations
 	lt.results = make([]LatencyResult, 0, totalTests)
 
-	// create worker pool with rate limiting
-	taskChan := make(chan func(), concurrent*2) // Buffer to prevent blocking
 	var wg sync.WaitGroup
 	
-	// start workers
-	for i := 0; i < lt.concurrent; i++ {
+	// Start initial requested workers
+	atomic.StoreInt64(&lt.activeWorkers, int64(lt.requestedWorkers))
+	for i := 0; i < lt.requestedWorkers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
-			for task := range taskChan {
-				task()
-				completed := atomic.AddInt64(&completedTests, 1)
-				if completed%100 == 0 || completed == int64(totalTests) {
-					fmt.Printf("\rProgress: %d/%d (%.2f%%)", completed, totalTests, float64(completed)/float64(totalTests)*100)
-				}
-			}
-		}()
+			lt.workerLoop(workerID)
+		}(i)
 	}
+	
+	// Start worker scaler
+	lt.workerScaler.Start()
+	defer lt.workerScaler.Stop()
 
-	for _, protocol := range protocols {
-		for _, size := range payloadSizes {
-			for i := 0; i < testPerSize; i++ {
-				proto := protocol
-				payloadSize := size
-				taskChan <- func() {
-					var result LatencyResult
-					if proto == "tcp" {
-						result = lt.testTCPPooled(payloadSize)
-					} else if proto == "http" {
-						result = lt.testHTTPPooled(payloadSize)
+	// Queue all tasks
+	go func() {
+		for _, protocol := range protocols {
+			for _, size := range payloadSizes {
+				for i := 0; i < testPerSize; i++ {
+					proto := protocol
+					payloadSize := size
+					task := func() LatencyResult {
+						if proto == "tcp" {
+							return lt.testTCPPooled(payloadSize)
+						} else if proto == "http" {
+							return lt.testHTTPPooled(payloadSize)
+						}
+						return LatencyResult{Protocol: proto, PayloadSize: payloadSize, Success: false, Error: "Unknown protocol"}
 					}
-					lt.resultsMutex.Lock()
-					lt.results = append(lt.results, result)
-					lt.resultsMutex.Unlock()
+					
+					// Add task to queue (blocks if queue is full)
+					lt.taskQueue <- task
 				}
 			}
 		}
-	}
+		close(lt.taskQueue)
+	}()
 
-	close(taskChan)
+	// Monitor progress
+	go func() {
+		startTime := time.Now()
+		for {
+			completed := atomic.LoadInt64(&lt.completedTests)
+			if completed >= int64(totalTests) {
+				break
+			}
+			
+			if completed%100 == 0 && completed > 0 {
+				elapsed := time.Since(startTime)
+				rate := float64(completed) / elapsed.Seconds()
+				activeWorkers := atomic.LoadInt64(&lt.activeWorkers)
+				fmt.Printf("\rProgress: %d/%d (%.2f%%) - Rate: %.1f pps - Workers: %d", 
+					completed, totalTests, float64(completed)/float64(totalTests)*100, rate, activeWorkers)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+
 	wg.Wait()
 
 	// Final progress update
@@ -488,6 +694,147 @@ func (lt *LatencyTester) RunTests(protocols []string, payloadSizes []int, testPe
 	
 	// Force garbage collection to free up memory
 	runtime.GC()
+	
+	// Display worker statistics if enabled
+	lt.printWorkerStats()
+}
+
+// printWorkerStats displays per-worker performance statistics
+func (lt *LatencyTester) printWorkerStats() {
+	if len(lt.workerStats) == 0 {
+		return
+	}
+	
+	fmt.Printf("\n========================================\n")
+	fmt.Printf("WORKER PERFORMANCE STATISTICS\n")
+	fmt.Printf("========================================\n")
+	
+	totalSent := int64(0)
+	totalSuccess := int64(0)
+	totalFailed := int64(0)
+	
+	lt.statsMutex.RLock()
+	activeCount := 0
+	for _, stats := range lt.workerStats {
+		totalSent += stats.PacketsSent
+		totalSuccess += stats.PacketsSuccess
+		totalFailed += stats.PacketsFailed
+		
+		if stats.IsActive {
+			activeCount++
+		}
+		
+		successRate := float64(0)
+		avgLatency := time.Duration(0)
+		if stats.PacketsSent > 0 {
+			successRate = float64(stats.PacketsSuccess) / float64(stats.PacketsSent) * 100
+		}
+		if stats.PacketsSuccess > 0 {
+			avgLatency = stats.TotalLatency / time.Duration(stats.PacketsSuccess)
+		}
+		
+		status := "INACTIVE"
+		if stats.IsActive {
+			status = "ACTIVE"
+		}
+		
+		fmt.Printf("Worker %d [%s]: Sent: %d, Success: %d (%.1f%%), Failed: %d, Avg Latency: %v\n",
+			stats.WorkerID, status, stats.PacketsSent, stats.PacketsSuccess, successRate, 
+			stats.PacketsFailed, avgLatency)
+	}
+	lt.statsMutex.RUnlock()
+	
+	fmt.Printf("\nScaling Summary: %d active workers, %d total created\n", activeCount, len(lt.workerStats))
+	
+	overallSuccessRate := float64(0)
+	if totalSent > 0 {
+		overallSuccessRate = float64(totalSuccess) / float64(totalSent) * 100
+	}
+	
+	fmt.Printf("\nOverall: Sent: %d, Success: %d (%.1f%%), Failed: %d\n",
+		totalSent, totalSuccess, overallSuccessRate, totalFailed)
+	fmt.Printf("========================================\n")
+}
+
+// workerLoop is the main loop for each worker goroutine
+func (lt *LatencyTester) workerLoop(workerID int) {
+	// Calculate rate limiting parameters for this worker
+	var rateLimiter *time.Ticker
+	var rateLimitChan <-chan time.Time
+	if lt.rateLimit > 0 {
+		// Distribute rate limit across all potential workers (maxWorkers)
+		perWorkerRate := lt.rateLimit / float64(lt.maxWorkers)
+		if perWorkerRate > 0 {
+			interval := time.Duration(float64(time.Second) / perWorkerRate)
+			rateLimiter = time.NewTicker(interval)
+			rateLimitChan = rateLimiter.C
+			defer rateLimiter.Stop()
+		}
+	}
+	
+	for {
+		// Check if we should exit (scale down)
+		currentWorkers := int(atomic.LoadInt64(&lt.activeWorkers))
+		if currentWorkers > lt.requestedWorkers && len(lt.taskQueue) == 0 {
+			// This worker can exit to scale down
+			atomic.AddInt64(&lt.activeWorkers, -1)
+			
+			// Mark worker as inactive
+			lt.statsMutex.Lock()
+			if workerID < len(lt.workerStats) {
+				lt.workerStats[workerID].IsActive = false
+			}
+			lt.statsMutex.Unlock()
+			
+			return
+		}
+		
+		// Get next task from queue
+		task, ok := <-lt.taskQueue
+		if !ok {
+			// Queue is closed, exit
+			atomic.AddInt64(&lt.activeWorkers, -1)
+			
+			// Mark worker as inactive
+			lt.statsMutex.Lock()
+			if workerID < len(lt.workerStats) {
+				lt.workerStats[workerID].IsActive = false
+			}
+			lt.statsMutex.Unlock()
+			
+			return
+		}
+		
+		// Rate limiting (if enabled)
+		if rateLimitChan != nil {
+			<-rateLimitChan
+		}
+		
+		// Execute the task
+		result := task()
+		
+		// Update worker stats
+		lt.statsMutex.Lock()
+		if workerID < len(lt.workerStats) {
+			lt.workerStats[workerID].PacketsSent++
+			if result.Success {
+				lt.workerStats[workerID].PacketsSuccess++
+				lt.workerStats[workerID].TotalLatency += result.RTT
+			} else {
+				lt.workerStats[workerID].PacketsFailed++
+			}
+			lt.workerStats[workerID].LastPacketTime = time.Now()
+		}
+		lt.statsMutex.Unlock()
+		
+		// Store result
+		lt.resultsMutex.Lock()
+		lt.results = append(lt.results, result)
+		lt.resultsMutex.Unlock()
+		
+		// Update progress counter
+		atomic.AddInt64(&lt.completedTests, 1)
+	}
 }
 
 // SyncClock implements NTP-like algorithm to synchronize clocks
@@ -895,6 +1242,12 @@ func (lt *LatencyTester) AnalyzeResults() {
 						fmt.Printf("      Latency Distribution:\n")
 						printPercentiles(protocolStats.Percentiles)
 					}
+					
+					// Print histograms for protocol breakdown
+					if protocolStats.RTTHistogram != nil && protocolStats.RTTHistogram.TotalCount > 0 {
+						fmt.Printf("      ")
+						protocolStats.RTTHistogram.PrintHistogram("RTT Histogram", 25)
+					}
 					fmt.Printf("\n")
 				}
 			}
@@ -953,6 +1306,19 @@ func calculateStatistics(protocol string, payloadSize int, results []LatencyResu
 	// Calculate percentiles
 	stats.Percentiles = calculatePercentiles(rttValues)
 
+	// Create histograms based on global configuration
+	if globalHistogramEnabled {
+		if globalHistogramWidth > 0 {
+			// Use fixed-width histograms
+			stats.RTTHistogram = NewFixedWidthHistogram(rttValues, globalHistogramWidth)
+			stats.OneWayHistogram = NewFixedWidthHistogram(oneWayValues, globalHistogramWidth)
+		} else {
+			// Use dynamic bucket sizing
+			stats.RTTHistogram = NewHistogram(rttValues, globalHistogramBuckets)
+			stats.OneWayHistogram = NewHistogram(oneWayValues, globalHistogramBuckets)
+		}
+	}
+
 	return stats
 }
 
@@ -988,6 +1354,14 @@ func printProtocolStats(stats Statistics) {
 		fmt.Printf("  Latency Distribution:\n")
 		printPercentiles(stats.Percentiles)
 	}
+	
+	// Print histograms
+	if stats.RTTHistogram != nil && stats.RTTHistogram.TotalCount > 0 {
+		stats.RTTHistogram.PrintHistogram("RTT Histogram", 30)
+	}
+	if stats.OneWayHistogram != nil && stats.OneWayHistogram.TotalCount > 0 {
+		stats.OneWayHistogram.PrintHistogram("One-Way Latency Histogram", 30)
+	}
 	fmt.Printf("\n")
 }
 
@@ -1003,6 +1377,14 @@ func printSizeStats(stats Statistics) {
 	if len(stats.Percentiles) > 0 {
 		fmt.Printf("  Latency Distribution:\n")
 		printPercentiles(stats.Percentiles)
+	}
+	
+	// Print histograms
+	if stats.RTTHistogram != nil && stats.RTTHistogram.TotalCount > 0 {
+		stats.RTTHistogram.PrintHistogram("RTT Histogram", 30)
+	}
+	if stats.OneWayHistogram != nil && stats.OneWayHistogram.TotalCount > 0 {
+		stats.OneWayHistogram.PrintHistogram("One-Way Latency Histogram", 30)
 	}
 	fmt.Printf("\n")
 }
@@ -1036,6 +1418,164 @@ func printPercentiles(percentiles map[float64]time.Duration) {
 	}
 }
 
+// NewHistogram creates a new histogram with dynamic bucket sizing based on data range
+func NewHistogram(values []time.Duration, bucketCount int) *Histogram {
+	if len(values) == 0 {
+		return &Histogram{}
+	}
+
+	// Sort values to find min/max
+	sortedValues := make([]time.Duration, len(values))
+	copy(sortedValues, values)
+	sort.Slice(sortedValues, func(i, j int) bool { return sortedValues[i] < sortedValues[j] })
+
+	minVal := sortedValues[0]
+	maxVal := sortedValues[len(sortedValues)-1]
+
+	// If all values are the same, create a single bucket
+	if minVal == maxVal {
+		return &Histogram{
+			BucketRanges: []time.Duration{maxVal},
+			BucketCounts: []int64{int64(len(values))},
+			BucketWidth:  0,
+			MinValue:     minVal,
+			MaxValue:     maxVal,
+			TotalCount:   int64(len(values)),
+		}
+	}
+
+	// Calculate bucket width
+	bucketWidth := (maxVal - minVal) / time.Duration(bucketCount)
+	if bucketWidth == 0 {
+		bucketWidth = time.Microsecond // Minimum bucket width
+	}
+
+	// Create bucket ranges
+	bucketRanges := make([]time.Duration, bucketCount)
+	bucketCounts := make([]int64, bucketCount)
+
+	for i := 0; i < bucketCount; i++ {
+		bucketRanges[i] = minVal + time.Duration(i+1)*bucketWidth
+	}
+	// Ensure the last bucket includes the maximum value
+	bucketRanges[bucketCount-1] = maxVal
+
+	// Count values in each bucket
+	for _, value := range values {
+		for i, upperBound := range bucketRanges {
+			if value <= upperBound {
+				bucketCounts[i]++
+				break
+			}
+		}
+	}
+
+	return &Histogram{
+		BucketRanges: bucketRanges,
+		BucketCounts: bucketCounts,
+		BucketWidth:  bucketWidth,
+		MinValue:     minVal,
+		MaxValue:     maxVal,
+		TotalCount:   int64(len(values)),
+	}
+}
+
+// NewFixedWidthHistogram creates a histogram with fixed bucket width
+func NewFixedWidthHistogram(values []time.Duration, bucketWidth time.Duration) *Histogram {
+	if len(values) == 0 {
+		return &Histogram{}
+	}
+
+	// Sort values to find min/max
+	sortedValues := make([]time.Duration, len(values))
+	copy(sortedValues, values)
+	sort.Slice(sortedValues, func(i, j int) bool { return sortedValues[i] < sortedValues[j] })
+
+	minVal := sortedValues[0]
+	maxVal := sortedValues[len(sortedValues)-1]
+
+	// Calculate number of buckets needed
+	bucketCount := int((maxVal-minVal)/bucketWidth) + 1
+
+	// Create bucket ranges
+	bucketRanges := make([]time.Duration, bucketCount)
+	bucketCounts := make([]int64, bucketCount)
+
+	for i := 0; i < bucketCount; i++ {
+		bucketRanges[i] = minVal + time.Duration(i+1)*bucketWidth
+	}
+	// Ensure the last bucket includes the maximum value
+	bucketRanges[bucketCount-1] = maxVal
+
+	// Count values in each bucket
+	for _, value := range values {
+		for i, upperBound := range bucketRanges {
+			if value <= upperBound {
+				bucketCounts[i]++
+				break
+			}
+		}
+	}
+
+	return &Histogram{
+		BucketRanges: bucketRanges,
+		BucketCounts: bucketCounts,
+		BucketWidth:  bucketWidth,
+		MinValue:     minVal,
+		MaxValue:     maxVal,
+		TotalCount:   int64(len(values)),
+	}
+}
+
+// PrintHistogram prints a visual representation of the histogram
+func (h *Histogram) PrintHistogram(title string, maxBarWidth int) {
+	if h.TotalCount == 0 {
+		fmt.Printf("  %s: No data\n", title)
+		return
+	}
+
+	fmt.Printf("  %s:\n", title)
+
+	// Find the maximum count for scaling
+	maxCount := int64(0)
+	for _, count := range h.BucketCounts {
+		if count > maxCount {
+			maxCount = count
+		}
+	}
+
+	if maxCount == 0 {
+		fmt.Printf("    No data in buckets\n")
+		return
+	}
+
+	// Print each bucket
+	lowerBound := h.MinValue
+	for i, upperBound := range h.BucketRanges {
+		count := h.BucketCounts[i]
+		percentage := float64(count) / float64(h.TotalCount) * 100
+
+		// Create bar representation
+		barLength := int(float64(count) / float64(maxCount) * float64(maxBarWidth))
+		bar := strings.Repeat("█", barLength)
+		if barLength == 0 && count > 0 {
+			bar = "▌" // Show something for very small counts
+		}
+
+		// Format the range
+		if i == 0 {
+			fmt.Printf("    [%8v - %8v]: %6d (%5.1f%%) %s\n", 
+				lowerBound, upperBound, count, percentage, bar)
+		} else {
+			fmt.Printf("    (%8v - %8v]: %6d (%5.1f%%) %s\n", 
+				lowerBound, upperBound, count, percentage, bar)
+		}
+		lowerBound = upperBound
+	}
+	fmt.Printf("    Total: %d samples, Range: %v - %v\n", 
+		h.TotalCount, h.MinValue, h.MaxValue)
+}
+
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if s == item {
@@ -1060,6 +1600,10 @@ func main() {
 	testPerSize := flag.Int("testPerSize", 10, "Number of tests per payload size")
 	concurrent := flag.Int("concurrent", 1, "Number of concurrent connections to test")
 	timeout := flag.Int("timeout", 10, "Timeout in seconds")
+	histogramBuckets := flag.Int("histogramBuckets", 10, "Number of histogram buckets (0 to disable histograms)")
+	histogramWidth := flag.String("histogramWidth", "", "Fixed histogram bucket width (e.g., '5ms', '10ms'). If not set, uses dynamic buckets.")
+	rateLimit := flag.Float64("rateLimit", 0, "Rate limit in packets per second (0 = no limit)")
+	maxWorkers := flag.Int("maxWorkers", 50, "Maximum number of concurrent workers (default: 50)")
 
 	// parse flags
 	flag.Parse()
@@ -1075,6 +1619,19 @@ func main() {
 			fmt.Println("Target is required for client mode")
 			flag.Usage()
 			return
+		}
+
+		// Configure histogram settings
+		globalHistogramBuckets = *histogramBuckets
+		globalHistogramEnabled = *histogramBuckets > 0
+		
+		if *histogramWidth != "" {
+			var err error
+			globalHistogramWidth, err = time.ParseDuration(*histogramWidth)
+			if err != nil {
+				fmt.Printf("Invalid histogram width '%s': %v\n", *histogramWidth, err)
+				return
+			}
 		}
 
 		protocols := make([]string, 0)
@@ -1116,6 +1673,8 @@ func main() {
 		}
 
 		tester := NewLatencyTester(*target, *tcpPort, *httpPort)
+		tester.rateLimit = *rateLimit
+		tester.maxWorkers = *maxWorkers
 		tester.RunTests(protocols, payloadSizes, *testPerSize, *concurrent, time.Duration(*timeout)*time.Second)
 		tester.AnalyzeResults()
 	} else if *mode == "server" {
